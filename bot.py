@@ -76,7 +76,7 @@ HELP = (
     "/new [nom]     → nouveau projet · /projets → liste · /projet <slug> → basculer\n\n"
     "🎞️ DÉRUSH — télécharge puis dérush :\n"
     "/rushs         → liste les rushs · /derush <nom> → 1re version dérushée\n"
-    "/telecharge <url> → télécharge une vidéo YouTube (ou lien direct) dans ~/rushs\n\n"
+    "(gros fichiers : rsync -P --inplace <fichier> ubuntu@<serveur>:~/rushs/)\n\n"
     "/garde N [N…]  → conserver les propositions #N\n"
     "/retire N [N…] → retirer de la sélection\n"
     "/conserves     → voir ce que tu as conservé\n"
@@ -1277,92 +1277,6 @@ def cut_concat(rush, segments, out, pre=0.3, post=0.4):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _onedrive_direct(link):
-    """Transforme un lien de partage OneDrive en lien de téléchargement direct (API shares)."""
-    b64 = base64.urlsafe_b64encode(link.strip().encode()).decode().rstrip("=")
-    return f"https://api.onedrive.com/v1.0/shares/u!{b64}/root/content"
-
-
-def handle_ytdl(chat_id, url):
-    """Télécharge une vidéo YouTube via yt-dlp vers ~/rushs."""
-    send(chat_id, "⬇️ Téléchargement YouTube en cours… (quelques minutes selon la durée)")
-    outf = os.path.join(RUSHS_DIR, "%(title)s.%(ext)s")
-    try:
-        result = subprocess.run(
-            ["yt-dlp",
-             "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
-             "--merge-output-format", "mp4",
-             "--restrict-filenames",
-             "-o", outf, url],
-            capture_output=True, timeout=3600
-        )
-        if result.returncode != 0:
-            err = result.stderr.decode(errors="replace")[-400:]
-            send(chat_id, f"⚠️ yt-dlp échoué :\n{err}")
-            return
-    except subprocess.TimeoutExpired:
-        send(chat_id, "⚠️ Timeout (1h) — vidéo trop longue ou réseau lent.")
-        return
-    except FileNotFoundError:
-        send(chat_id, "⚠️ yt-dlp introuvable dans le conteneur. Rebuilde l'image.")
-        return
-    except Exception as e:
-        send(chat_id, f"⚠️ Erreur téléchargement : {e}")
-        return
-    files = sorted(
-        [f for f in os.listdir(RUSHS_DIR) if f.lower().endswith(RUSH_EXTS)],
-        key=lambda f: os.path.getmtime(os.path.join(RUSHS_DIR, f))
-    )
-    fname = files[-1] if files else None
-    if not fname:
-        send(chat_id, "⚠️ Téléchargement terminé mais aucun fichier vidéo trouvé dans ~/rushs.")
-        return
-    mb = os.path.getsize(os.path.join(RUSHS_DIR, fname)) // 1024 // 1024
-    send(chat_id, f"✅ « {fname} » téléchargé ({mb} Mo). Lance /derush pour dérusher.")
-
-
-def handle_download(chat_id, link):
-    """Télécharge un rush : YouTube via yt-dlp, sinon lien direct (OneDrive, HTTP)."""
-    link = (link or "").strip()
-    if not link:
-        send(chat_id, "Usage : /telecharge <url YouTube ou lien direct>")
-        return
-    is_yt = any(d in link.lower() for d in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
-    if is_yt:
-        handle_ytdl(chat_id, link)
-        return
-    is_od = any(d in link.lower() for d in ("1drv.ms", "onedrive", "sharepoint"))
-    url = _onedrive_direct(link) if is_od else link
-    send(chat_id, "⬇️ Téléchargement depuis OneDrive sur le serveur… (gros fichier = quelques minutes)")
-    try:
-        r = requests.get(url, stream=True, timeout=120, allow_redirects=True)
-        if r.status_code >= 400 and is_od:           # repli : lien direct avec ?download=1
-            r = requests.get(link + ("&" if "?" in link else "?") + "download=1",
-                             stream=True, timeout=120, allow_redirects=True)
-        r.raise_for_status()
-        cd = r.headers.get("content-disposition", "")
-        m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", cd)
-        name = os.path.basename((m.group(1) if m else f"rush_{int(time.time())}.mov")).replace("/", "_")
-        dest = os.path.join(RUSHS_DIR, name)
-        total = 0
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    total += len(chunk)
-    except Exception as e:
-        send(chat_id, f"⚠️ Téléchargement échoué : {str(e)[:200]}")
-        return
-    mb = total // 1024 // 1024
-    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                            "-of", "csv=p=0", dest], capture_output=True)
-    if probe.returncode == 0:
-        send(chat_id, f"✅ « {name} » téléchargé ({mb} Mo) et valide. Lance /derush.")
-    else:
-        send(chat_id, f"⚠️ « {name} » téléchargé ({mb} Mo) mais illisible — le lien n'était "
-                      "peut-être pas un partage direct de fichier. Vérifie le partage OneDrive.")
-
-
 def handle_rushs(chat_id):
     rushs = list_rushs()
     if not rushs:
@@ -1503,8 +1417,6 @@ def handle_command(chat_id, parts):
     elif cmd in ("autoanim", "autoanime"):
         s["auto_anim"] = not s.get("auto_anim", True)
         send(chat_id, f"📊 Animations auto dans le flux : {'activées' if s['auto_anim'] else 'désactivées'}.")
-    elif cmd in ("telecharge", "telecharger", "download", "dl"):
-        handle_download(chat_id, " ".join(parts[1:]).strip())
     elif cmd in ("rushs", "rush"):
         handle_rushs(chat_id)
     elif cmd in ("derush", "derusher", "dérush"):
@@ -1689,11 +1601,6 @@ def handle(msg):
             handle_thumbnails(chat_id, session(chat_id), body)
             return
         handle_command(chat_id, text.split())
-        return
-
-    # Lien de partage OneDrive collé → téléchargement direct du rush sur le serveur
-    if text and any(d in text.lower() for d in ("1drv.ms", "onedrive", "sharepoint")):
-        handle_download(chat_id, text)
         return
 
     s = session(chat_id)
